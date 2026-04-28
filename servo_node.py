@@ -20,14 +20,34 @@ class ServoNode(Node):
         # Setup 5 Servo (Ch 0,1,2,3,4) dengan standar pulse MG996R
         self.servos = [servo.Servo(self.pca.channels[i], min_pulse=600, max_pulse=2400) for i in range(5)]
         
-        self.get_logger().info("Hardware PCA9685 Aktif.")
+        self.get_logger().info("Hardware PCA9685 Aktif. Siap menerima perintah...")
 
     def servo_cb(self, msg):
-        angles = msg.data # [Base, Shoulder, Elbow, Wrist, Gripper]
+        angles = msg.data # Urutan: [Base, Shoulder, Elbow, Wrist, Gripper]
         for i, angle in enumerate(angles):
             if i < len(self.servos):
                 # Proteksi batas aman mekanik servo (0 - 180 derajat)
                 safe_angle = max(0.0, min(180.0, angle))
+                
+                # ---------------------------------------------------------
+                # BLOK KOREKSI ARAH SERVO (REVERSE DIRECTION)
+                # ---------------------------------------------------------
+                # Index 0 = Base
+                # Index 1 = Shoulder (Bahu) <-- Ini yang kita balik
+                # Index 2 = Elbow (Siku)
+                # Index 3 = Wrist (Pergelangan)
+                # Index 4 = Gripper (Capit)
+                
+                if i == 1:
+                    # Balik arah putaran servo bahu
+                    safe_angle = 180.0 - safe_angle
+                
+                # Kalau misalnya siku (Elbow) lu ikutan kebalik juga, 
+                # hapus tanda pagar (#) di bawah ini:
+                # if i == 2:
+                #     safe_angle = 180.0 - safe_angle
+                # ---------------------------------------------------------
+
                 try:
                     self.servos[i].angle = safe_angle
                 except Exception as e:
@@ -36,10 +56,15 @@ class ServoNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = ServoNode()
-    rclpy.spin(node)
-    node.pca.deinit() # Matikan tegangan saat node mati
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # Sangat Penting: Matikan tegangan servo saat program di-stop (Ctrl+C)
+        node.pca.deinit() 
+        node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
