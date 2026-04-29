@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, simpledialog, messagebox
 import threading
 import numpy as np
 import math
 import queue
 import random
+import json
+from pathlib import Path
 
 try:
     import rclpy
@@ -155,6 +157,9 @@ class RobotGUI:
                 [0.0,   0.0, 0.1,   0.0]],
         }
         self.active_dh_edit = None
+        self.presets_path = Path(__file__).with_name("viz_env_presets.json")
+        self.presets = self.load_presets_from_disk()
+        self.loaded_preset_name = None
         
         self.scale_factor = 150.0  # pixels per meter
         self.origin_x = 400
@@ -216,6 +221,20 @@ class RobotGUI:
         self.dof_combo.grid(row=0, column=1, padx=5, pady=5)
         self.dof_combo.bind("<<ComboboxSelected>>", self.on_dof_change)
 
+        preset_frame = ttk.LabelFrame(mid_frame, text="Preset Manager", padding=10)
+        preset_frame.pack(fill='x', pady=5)
+        ttk.Label(preset_frame, text="Saved Preset:").grid(row=0, column=0, padx=5, pady=5, sticky='w')
+        self.preset_var = tk.StringVar()
+        self.preset_combo = ttk.Combobox(preset_frame, textvariable=self.preset_var, state="readonly")
+        self.preset_combo.grid(row=0, column=1, padx=5, pady=5, sticky='ew')
+        preset_frame.columnconfigure(1, weight=1)
+        ttk.Button(preset_frame, text="LOAD", command=self.load_selected_preset).grid(row=1, column=0, padx=5, pady=5, sticky='ew')
+        ttk.Button(preset_frame, text="SAVE", command=self.save_preset).grid(row=1, column=1, padx=5, pady=5, sticky='ew')
+        ttk.Button(preset_frame, text="DELETE", command=self.delete_selected_preset).grid(row=1, column=2, padx=5, pady=5, sticky='ew')
+        self.lbl_preset_status = ttk.Label(preset_frame, text="Preset DH bisa disimpan ke file lokal JSON.")
+        self.lbl_preset_status.grid(row=2, column=0, columnspan=3, padx=5, pady=(3, 0), sticky='w')
+        self.refresh_preset_combo()
+
         self.dh_frame = ttk.LabelFrame(mid_frame, text="DH Parameters (a, alpha, d, theta_offset)", padding=10)
         self.dh_frame.pack(fill='x', pady=5)
         
@@ -263,6 +282,7 @@ class RobotGUI:
         ttk.Button(ctrl_frame, text="HOME", command=lambda: self.node.publish_command("HOME")).pack(fill='x', pady=5)
 
     def build_dh_and_js_panels(self):
+        self.active_dh_edit = None
         for widget in self.dh_frame.winfo_children():
             widget.destroy()
         
@@ -321,6 +341,7 @@ class RobotGUI:
         self.dh_params = [list(row) for row in self.CANONICAL_DH[new_dof]]
         self.dof = new_dof
         self.current_joints = [0.0] * self.dof
+        self.mark_preset_dirty()
 
         self.build_dh_and_js_panels()
         self.publish_current_dh()
@@ -349,6 +370,7 @@ class RobotGUI:
         var.set(f"{float(val):.3f}")
         try:
             self.dh_params[r][c] = float(val)
+            self.mark_preset_dirty()
             self.draw_robot()
         except ValueError: pass
 
@@ -356,6 +378,7 @@ class RobotGUI:
         try:
             for j in range(4):
                 self.dh_params[i][j] = float(vars_row[j].get())
+            self.mark_preset_dirty()
             self.draw_robot()
             self.publish_current_dh()
             
@@ -377,11 +400,185 @@ class RobotGUI:
             for i in range(self.dof):
                 for j in range(4):
                     self.dh_params[i][j] = float(self.dh_vars[i][j].get())
+            self.mark_preset_dirty()
             self.publish_current_dh()
             self.generate_workspace()
             self.draw_robot()
         except ValueError:
             print("Invalid DH parameter input!")
+
+    def load_presets_from_disk(self):
+        if not self.presets_path.exists():
+            return {}
+
+        try:
+            raw_data = json.loads(self.presets_path.read_text(encoding='utf-8'))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"Warning: failed to load presets from {self.presets_path}: {exc}")
+            return {}
+
+        preset_map = raw_data.get("presets", raw_data) if isinstance(raw_data, dict) else {}
+        if not isinstance(preset_map, dict):
+            return {}
+        valid_presets = {}
+        for name, preset in preset_map.items():
+            normalized_name = self.normalize_preset_name(name)
+            normalized_preset = self.normalize_preset_payload(preset)
+            if normalized_name and normalized_preset:
+                valid_presets[normalized_name] = normalized_preset
+        return valid_presets
+
+    def save_presets_to_disk(self):
+        payload = {"presets": self.presets}
+        self.presets_path.write_text(json.dumps(payload, indent=2), encoding='utf-8')
+
+    def normalize_preset_name(self, name):
+        if name is None:
+            return ""
+        return " ".join(str(name).strip().split())
+
+    def normalize_preset_payload(self, preset):
+        if not isinstance(preset, dict):
+            return None
+
+        dh_rows = preset.get("dh_params")
+        if not isinstance(dh_rows, list):
+            return None
+
+        try:
+            dof = int(preset.get("dof", len(dh_rows)))
+        except (TypeError, ValueError):
+            return None
+        if dof < 3 or dof > 6 or len(dh_rows) != dof:
+            return None
+
+        normalized_rows = []
+        for row in dh_rows:
+            if not isinstance(row, list) or len(row) != 4:
+                return None
+            try:
+                normalized_rows.append([float(value) for value in row])
+            except (TypeError, ValueError):
+                return None
+
+        return {"dof": dof, "dh_params": normalized_rows}
+
+    def get_current_preset_payload(self):
+        return {
+            "dof": self.dof,
+            "dh_params": [[float(value) for value in row] for row in self.dh_params]
+        }
+
+    def refresh_preset_combo(self, selected_name=None):
+        preset_names = sorted(self.presets)
+        self.preset_combo["values"] = preset_names
+
+        if selected_name in self.presets:
+            self.preset_var.set(selected_name)
+        elif preset_names:
+            current_name = self.preset_var.get()
+            self.preset_var.set(current_name if current_name in self.presets else preset_names[0])
+        else:
+            self.preset_var.set("")
+
+    def set_preset_status(self, text, color='#e0e0e0'):
+        if hasattr(self, 'lbl_preset_status'):
+            self.lbl_preset_status.config(text=text, foreground=color)
+
+    def mark_preset_dirty(self):
+        if self.loaded_preset_name and self.loaded_preset_name in self.presets:
+            self.set_preset_status(f"Preset '{self.loaded_preset_name}' berubah. Simpan jika ingin update.", "#ffaa00")
+        else:
+            self.set_preset_status("Konfigurasi DH saat ini belum disimpan sebagai preset.", "#ffaa00")
+
+    def save_preset(self):
+        suggested_name = self.preset_var.get().strip() or f"Preset DOF {self.dof}"
+        preset_name = simpledialog.askstring(
+            "Save Preset",
+            "Masukkan nama preset:",
+            initialvalue=suggested_name,
+            parent=self.root
+        )
+        preset_name = self.normalize_preset_name(preset_name)
+        if not preset_name:
+            return
+
+        if preset_name in self.presets:
+            should_overwrite = messagebox.askyesno(
+                "Overwrite Preset",
+                f"Preset '{preset_name}' sudah ada. Timpa preset ini?",
+                parent=self.root
+            )
+            if not should_overwrite:
+                return
+
+        self.presets[preset_name] = self.get_current_preset_payload()
+        try:
+            self.save_presets_to_disk()
+        except OSError as exc:
+            messagebox.showerror(
+                "Save Preset Failed",
+                f"Gagal menyimpan preset ke:\n{self.presets_path}\n\n{exc}",
+                parent=self.root
+            )
+            return
+
+        self.loaded_preset_name = preset_name
+        self.refresh_preset_combo(preset_name)
+        self.set_preset_status(f"Preset '{preset_name}' tersimpan.", "#00ffcc")
+
+    def load_selected_preset(self):
+        preset_name = self.normalize_preset_name(self.preset_var.get())
+        if preset_name not in self.presets:
+            messagebox.showinfo("Load Preset", "Pilih preset yang ingin dimuat.", parent=self.root)
+            return
+
+        preset = self.normalize_preset_payload(self.presets[preset_name])
+        if preset is None:
+            messagebox.showerror("Load Preset Failed", f"Preset '{preset_name}' tidak valid.", parent=self.root)
+            return
+
+        self.dof = preset["dof"]
+        self.dof_var.set(str(self.dof))
+        self.dh_params = [list(row) for row in preset["dh_params"]]
+        self.current_joints = [0.0] * self.dof
+        self.loaded_preset_name = preset_name
+
+        self.build_dh_and_js_panels()
+        self.publish_current_dh()
+        self.generate_workspace()
+        self.draw_robot()
+        self.set_preset_status(f"Preset '{preset_name}' dimuat.", "#00ffcc")
+
+    def delete_selected_preset(self):
+        preset_name = self.normalize_preset_name(self.preset_var.get())
+        if preset_name not in self.presets:
+            messagebox.showinfo("Delete Preset", "Pilih preset yang ingin dihapus.", parent=self.root)
+            return
+
+        should_delete = messagebox.askyesno(
+            "Delete Preset",
+            f"Hapus preset '{preset_name}'?",
+            parent=self.root
+        )
+        if not should_delete:
+            return
+
+        del self.presets[preset_name]
+        try:
+            self.save_presets_to_disk()
+        except OSError as exc:
+            messagebox.showerror(
+                "Delete Preset Failed",
+                f"Gagal memperbarui file preset:\n{self.presets_path}\n\n{exc}",
+                parent=self.root
+            )
+            return
+
+        if self.loaded_preset_name == preset_name:
+            self.loaded_preset_name = None
+        self.refresh_preset_combo()
+        self.set_preset_status(f"Preset '{preset_name}' dihapus.", "#ff8888")
 
 
 
