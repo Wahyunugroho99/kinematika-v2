@@ -36,6 +36,8 @@ class HardwareBridgeNode(Node):
             2: {"servo": servo.Servo(self.pca.channels[2], min_pulse=600, max_pulse=2400), "dir": 1,  "offset": 90}, # Elbow
             3: {"servo": servo.Servo(self.pca.channels[3], min_pulse=600, max_pulse=2400), "dir": 1,  "offset": 90}, # Wrist
 }
+        self.clamp_active = {joint_idx: False for joint_idx in self.servos}
+        self.unsupported_joint_warned = False
         
         # Channel khusus Gripper (Capit)
         self.gripper_channel = 4
@@ -44,26 +46,50 @@ class HardwareBridgeNode(Node):
         # Subscribers
         self.joint_sub = self.create_subscription(JointState, '/joint_states', self.joint_cb, 10)
         self.cmd_sub = self.create_subscription(String, '/robot_command', self.cmd_cb, 10)
+        self.hw_joint_pub = self.create_publisher(JointState, '/joint_states_hw', 10)
         
         self.get_logger().info("Hardware Bridge PCA9685 Aktif. Siap memutar servo!")
 
     def joint_cb(self, msg):
         """Menerima array Radian dari IBVS Controller dan mengubahnya ke Derajat."""
         positions_rad = msg.position
+        applied_positions = [0.0] * len(positions_rad)
+
+        unsupported_indices = [i for i in range(len(positions_rad)) if i not in self.servos]
+        if unsupported_indices and not self.unsupported_joint_warned:
+            self.get_logger().warning(
+                f"Joint {unsupported_indices} tidak punya mapping servo. Viz hardware akan menahan joint tersebut di 0 rad."
+            )
+            self.unsupported_joint_warned = True
         
         for i, rad in enumerate(positions_rad):
             if i in self.servos:
                 # Konversi: 0 radian = 90 derajat (Tengah)
                 # Rumus: (rad * 180 / pi) + 90
                 cfg = self.servos[i]
-                deg = cfg["dir"] * math.degrees(rad) + cfg["offset"]
+                raw_deg = cfg["dir"] * math.degrees(rad) + cfg["offset"]
                 
                 # Batasi (Clamp) agar tidak merusak servo mekanis
-                deg = max(0.0, min(180.0, deg))
+                deg = max(0.0, min(180.0, raw_deg))
+                is_clamped = abs(deg - raw_deg) > 1e-6
+                if is_clamped and not self.clamp_active[i]:
+                    self.get_logger().warning(
+                        f"Servo joint {i} kena clamp: request {raw_deg:.1f}°, applied {deg:.1f}°."
+                    )
+                    self.clamp_active[i] = True
+                elif not is_clamped and self.clamp_active[i]:
+                    self.get_logger().info(f"Servo joint {i} kembali dalam range aman.")
+                    self.clamp_active[i] = False
+
+                applied_positions[i] = math.radians((deg - cfg["offset"]) / cfg["dir"])
                 try:
                     cfg["servo"].angle = deg
                 except Exception as e:
                     self.get_logger().error(f"Error memutar servo {i}: {e}")
+
+        hw_msg = JointState()
+        hw_msg.position = applied_positions
+        self.hw_joint_pub.publish(hw_msg)
 
     def cmd_cb(self, msg):
         """Mendengarkan perintah capit."""
