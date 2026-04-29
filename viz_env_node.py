@@ -6,6 +6,7 @@ import numpy as np
 import math
 import queue
 import random
+import time
 import json
 from pathlib import Path
 
@@ -34,6 +35,7 @@ class VizEnvNode(Node):
         self.is_mock = not ROS2_AVAILABLE
         
         self.msg_queue = queue.Queue()
+        self.hw_msg_queue = queue.Queue()
         self.target_queue = queue.Queue()
         
         if not self.is_mock:
@@ -44,6 +46,7 @@ class VizEnvNode(Node):
             self.bbox_sub = self.create_subscription(Point, '/simulated_yolo_bbox', self.bbox_cb, 10)
 
             self.joint_sub = self.create_subscription(JointState, '/joint_states', self.joint_callback, 10)
+            self.hw_joint_sub = self.create_subscription(JointState, '/joint_states_hw', self.hw_joint_callback, 10)
             self.target_sub = self.create_subscription(Point, '/target_ik_point', self.target_callback, 10)
             self.cmd_sub = self.create_subscription(String, '/robot_command', self.cmd_cb, 10)
             self.status_sub = self.create_subscription(String, '/robot_status', self.status_cb, 10)
@@ -64,6 +67,9 @@ class VizEnvNode(Node):
 
     def joint_callback(self, msg):
         self.msg_queue.put(list(msg.position))
+
+    def hw_joint_callback(self, msg):
+        self.hw_msg_queue.put(list(msg.position))
 
     def target_callback(self, msg):
         self.target_queue.put((msg.x, msg.y, msg.z))
@@ -105,6 +111,8 @@ class RobotGUI:
         
         self.dof = 6
         self.current_joints = [0.0] * self.dof # Now clean Zeroes thanks to new DH!
+        self.pose_source = "controller-commanded"
+        self.last_hw_pose_time = 0.0
         self.target_x, self.target_y, self.target_z = 0.0, 0.0, 0.0
         self.has_target       = False
         self.cam_mode         = "realcam"  # fixed to realcam
@@ -332,6 +340,8 @@ class RobotGUI:
             
         self.lbl_tcp = ttk.Label(self.js_frame, text="TCP: X=0.00 Y=0.00 Z=0.00", font=('Courier', 10, 'bold'), foreground='#00ffcc')
         self.lbl_tcp.grid(row=(self.dof//2)+1, column=0, columnspan=2, pady=10)
+        self.lbl_pose_source = ttk.Label(self.js_frame, text="Pose Source: controller-commanded (/joint_states)", font=('Courier', 9), foreground='#ffaa00')
+        self.lbl_pose_source.grid(row=(self.dof//2)+2, column=0, columnspan=2, pady=(0, 4), sticky='w')
 
     def on_dof_change(self, event):
         new_dof = int(self.dof_var.get())
@@ -420,6 +430,7 @@ class RobotGUI:
         preset_map = raw_data.get("presets", raw_data) if isinstance(raw_data, dict) else {}
         if not isinstance(preset_map, dict):
             return {}
+
         valid_presets = {}
         for name, preset in preset_map.items():
             normalized_name = self.normalize_preset_name(name)
@@ -1127,11 +1138,25 @@ class RobotGUI:
 
     def update_loop(self):
         has_new = False
+        now = time.monotonic()
+
+        try:
+            while True:
+                hw_jnts = self.node.hw_msg_queue.get_nowait()
+                if len(hw_jnts) == self.dof:
+                    self.current_joints = hw_jnts
+                    self.pose_source = "hardware-applied"
+                    self.last_hw_pose_time = now
+                    has_new = True
+        except queue.Empty:
+            pass
+
         try:
             while True:
                 jnts = self.node.msg_queue.get_nowait()
-                if len(jnts) == self.dof:
+                if len(jnts) == self.dof and (now - self.last_hw_pose_time) > 0.25:
                     self.current_joints = jnts
+                    self.pose_source = "controller-commanded"
                     has_new = True
         except queue.Empty: pass
             
@@ -1205,6 +1230,19 @@ class RobotGUI:
             points, Ts = self.calculate_fk(self.current_joints)
             ee = points[-1]
             self.lbl_tcp.config(text=f"TCP: X={ee[0]:.3f} Y={ee[1]:.3f} Z={ee[2]:.3f}")
+            if self.pose_source == "hardware-applied":
+                hw_text = "Pose Source: hardware-applied (/joint_states_hw)"
+                if self.dof > 4:
+                    hw_text += " | joint >4 fixed at 0"
+                self.lbl_pose_source.config(
+                    text=hw_text,
+                    foreground="#00ffcc"
+                )
+            else:
+                self.lbl_pose_source.config(
+                    text="Pose Source: controller-commanded (/joint_states)",
+                    foreground="#ffaa00"
+                )
             
             self.draw_robot()
             
