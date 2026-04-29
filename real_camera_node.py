@@ -23,7 +23,7 @@ Subscribed topics:
 
 ────────────────
 Standalone (no ROS2):
-  python real_camera_node.py                        # track kubus and silinder
+  python3 real_camera_node.py                       # track kubus and silinder
   python real_camera_node.py --class bottle         # one class by name
   python real_camera_node.py --class kubus,silinder # multiple class names
   python real_camera_node.py --class 39             # by COCO index
@@ -34,7 +34,8 @@ ROS2:
     --ros-args \\
     -p model_path:=best.pt \\
     -p target_class:=kubus,silinder \\
-    -p camera_id:=0 \\
+    -p camera_id:=1 \\
+    -p flip_code:=0 \\
     -p conf_threshold:=0.45 \\
     -p show_preview:=true
 ────────────────
@@ -43,6 +44,7 @@ ROS2:
 import sys
 import argparse
 import time
+import threading
 
 import cv2
 import numpy as np
@@ -90,8 +92,9 @@ except ImportError:
 DEFAULT_MODEL = 'best.pt'
 DEFAULT_CLASS = 'kubus,silinder'  # comma-separated target classes
 DEFAULT_CONF  = 0.15
-DEFAULT_CAM   = 0
-DEFAULT_IMGSZ = 416
+DEFAULT_CAM   = 1
+DEFAULT_IMGSZ = 320
+DEFAULT_FLIP_CODE = 0  # 0 = flip vertically; use 1 for mirror, -1 for both axes
 
 # ════════════════════════════════════════════════════════════════
 
@@ -120,6 +123,13 @@ def source_label(source) -> str:
     return str(source)
 
 
+def flip_frame_if_needed(frame, flip_code):
+    """Correct webcam orientation when a flip code is configured."""
+    if flip_code is None:
+        return frame
+    return cv2.flip(frame, flip_code)
+
+
 def capture_is_usable(cap) -> bool:
     """
     Some Linux backends report "opened" but fail on the first frame read.
@@ -130,6 +140,45 @@ def capture_is_usable(cap) -> bool:
         if ok and frame is not None and getattr(frame, 'size', 0) > 0:
             return True
     return False
+
+
+class LatestFrameReader:
+    """Continuously drains the webcam so detection always sees the newest frame."""
+
+    def __init__(self, cap, flip_code):
+        self.cap = cap
+        self.flip_code = flip_code
+        self._lock = threading.Lock()
+        self._latest = None
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        while self._running:
+            ok, frame = self.cap.read()
+            if not ok or frame is None:
+                time.sleep(0.005)
+                continue
+
+            frame = flip_frame_if_needed(frame, self.flip_code)
+            with self._lock:
+                self._latest = frame
+
+    def read(self):
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            with self._lock:
+                if self._latest is not None:
+                    return True, self._latest.copy()
+            time.sleep(0.005)
+        return False, None
+
+    def release(self):
+        self._running = False
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self.cap.release()
 
 
 def safe_show_preview(window_name: str, frame) -> bool:
@@ -231,7 +280,8 @@ class YOLODetector:
                  conf_threshold: float = 0.45,
                  camera_id: int = 0,
                  imgsz: int = DEFAULT_IMGSZ,
-                 ema_alpha: float = 0.35):
+                 ema_alpha: float = 0.35,
+                 flip_code: int | None = DEFAULT_FLIP_CODE):
 
         self.model          = model
         self.target_classes = list(target_classes)
@@ -240,10 +290,12 @@ class YOLODetector:
         self.conf_threshold = conf_threshold
         self.imgsz          = imgsz
         self.ema_alpha      = ema_alpha
+        self.flip_code      = flip_code
         self.last_detected_class = None
 
         # Camera - use only the selected webcam index
         self.cap = None
+        self.frame_reader = None
         self.camera_source = camera_id
         sources_to_try = build_camera_sources(camera_id)
         backends_to_try = build_capture_backends()
@@ -257,6 +309,7 @@ class YOLODetector:
                         test_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                         test_cap.set(cv2.CAP_PROP_FOURCC,
                                      cv2.VideoWriter_fourcc(*'MJPG'))
+                        test_cap.set(cv2.CAP_PROP_FPS, 30)
                         test_cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
                         test_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
                         if not capture_is_usable(test_cap):
@@ -265,6 +318,8 @@ class YOLODetector:
                         self.cap = test_cap
                         self.camera_source = source
                         # Try to set resolution, but don't fail if not supported
+                        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                        self.cap.set(cv2.CAP_PROP_FPS, 30)
                         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
                         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
                         # Actually get the resolution (might differ from requested)
@@ -310,6 +365,7 @@ class YOLODetector:
 
             raise RuntimeError(error_msg)
 
+        self.frame_reader = LatestFrameReader(self.cap, self.flip_code)
         print(f"[INFO] Tracking classes: '{self.target_label}'  conf>={conf_threshold}")
 
         # EMA state
@@ -391,12 +447,13 @@ class YOLODetector:
         self._area = 0.0
 
     def read_frame(self):
-        for _ in range(2):
-            self.cap.grab()
-        return self.cap.retrieve()
+        return self.frame_reader.read()
 
     def release(self):
-        self.cap.release()
+        if self.frame_reader is not None:
+            self.frame_reader.release()
+        elif self.cap is not None:
+            self.cap.release()
         try:
             cv2.destroyAllWindows()
         except cv2.error:
@@ -479,6 +536,7 @@ class RealCameraNode(Node):
         self.declare_parameter('camera_id',       DEFAULT_CAM)
         self.declare_parameter('conf_threshold',  DEFAULT_CONF)
         self.declare_parameter('imgsz',           DEFAULT_IMGSZ)
+        self.declare_parameter('flip_code',        DEFAULT_FLIP_CODE)
         self.declare_parameter('show_preview',    True)
 
         model_path  = self.get_parameter('model_path').get_parameter_value().string_value
@@ -486,6 +544,7 @@ class RealCameraNode(Node):
         camera_id   = self.get_parameter('camera_id').get_parameter_value().integer_value
         conf_thr    = self.get_parameter('conf_threshold').get_parameter_value().double_value
         imgsz       = self.get_parameter('imgsz').get_parameter_value().integer_value
+        flip_code   = self.get_parameter('flip_code').get_parameter_value().integer_value
         self.show   = self.get_parameter('show_preview').get_parameter_value().bool_value
 
         # Load model and resolve target classes (supports names and/or indices)
@@ -498,6 +557,7 @@ class RealCameraNode(Node):
             conf_threshold = conf_thr,
             camera_id      = camera_id,
             imgsz          = imgsz,
+            flip_code      = flip_code,
         )
 
         self.bbox_pub   = self.create_publisher(Point, '/simulated_yolo_bbox', 10)
@@ -545,7 +605,7 @@ class RealCameraNode(Node):
 # ════════════════════════════════════════════════════════════════
 
 def run_standalone(model: "YOLO", target_classes: list[str], conf: float,
-                   cam: int, imgsz: int):
+                   cam: int, imgsz: int, flip_code: int | None):
     """Camera loop — model already loaded and class already resolved."""
     detector = YOLODetector(
         model          = model,
@@ -553,6 +613,7 @@ def run_standalone(model: "YOLO", target_classes: list[str], conf: float,
         conf_threshold = conf,
         camera_id      = cam,
         imgsz          = imgsz,
+        flip_code      = flip_code,
     )
     print(f"[INFO] Press 'q' to quit | 'r' to reset EMA")
 
@@ -593,7 +654,7 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter,
         epilog=(
             "examples:\n"
-            "  python real_camera_node.py                        # track kubus and silinder\n"
+            "  python3 real_camera_node.py                       # track kubus and silinder\n"
             "  python real_camera_node.py --class bottle         # by name\n"
             "  python real_camera_node.py --class kubus,silinder # multiple classes by name\n"
             "  python real_camera_node.py --class 39             # by COCO index (bottle)\n"
@@ -611,10 +672,17 @@ def main():
                         help=f"Detection confidence threshold (default: {DEFAULT_CONF})")
     parser.add_argument('--imgsz',  default=DEFAULT_IMGSZ, type=int,
                         help=f"YOLO inference size; lower is faster (default: {DEFAULT_IMGSZ})")
+    parser.add_argument('--flip-code', default=DEFAULT_FLIP_CODE, type=int,
+                        choices=(-1, 0, 1),
+                        help=f"OpenCV flip code for webcam orientation (default: {DEFAULT_FLIP_CODE}; -1=both, 0=vertical, 1=horizontal)")
+    parser.add_argument('--no-flip', action='store_true',
+                        help="Disable webcam orientation flip")
     parser.add_argument('--list-classes', action='store_true',
                         help="Print class index table and exit")
     parser.add_argument('--standalone', action='store_true',
                         help="Force standalone mode (no ROS2)")
+    parser.add_argument('--ros', action='store_true',
+                        help="Force ROS2 node mode when running this file directly")
 
     cli_args = [a for a in sys.argv[1:]
                 if not (a.startswith('--ros-args') or a in
@@ -636,8 +704,11 @@ def main():
     target_classes = resolve_classes(model, args.cls)
     print(f"[INFO] Target classes: '{','.join(target_classes)}'")
 
-    if args.standalone or not ROS2_AVAILABLE:
-        run_standalone(model, target_classes, args.conf, args.cam, args.imgsz)
+    flip_code = None if args.no_flip else args.flip_code
+    has_ros_args = any(a == '--ros-args' for a in sys.argv[1:])
+
+    if args.standalone or not ROS2_AVAILABLE or (not args.ros and not has_ros_args):
+        run_standalone(model, target_classes, args.conf, args.cam, args.imgsz, flip_code)
     else:
         rclpy.init()
         node = RealCameraNode()
