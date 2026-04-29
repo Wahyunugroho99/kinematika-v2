@@ -31,11 +31,11 @@ class HardwareBridgeNode(Node):
         # Format: { 'joint_index': (pca_channel, min_pulse, max_pulse, offset_derajat) }
         # min/max_pulse standar servo adalah 500-2500, tapi MG996R kadang butuh 600-2400.
         self.servos = {
-            0: servo.Servo(self.pca.channels[0], min_pulse=600, max_pulse=2400), # Base
-            1: servo.Servo(self.pca.channels[1], min_pulse=600, max_pulse=2400), # Shoulder
-            2: servo.Servo(self.pca.channels[2], min_pulse=600, max_pulse=2400), # Elbow
-            3: servo.Servo(self.pca.channels[3], min_pulse=600, max_pulse=2400), # Wrist
-        }
+            0: {"servo": servo.Servo(self.pca.channels[0], min_pulse=600, max_pulse=2400), "dir": 1,  "offset": 90}, # Base
+            1: {"servo": servo.Servo(self.pca.channels[1], min_pulse=600, max_pulse=2400), "dir": -1, "offset": 90}, # Shoulder (dibalik)
+            2: {"servo": servo.Servo(self.pca.channels[2], min_pulse=600, max_pulse=2400), "dir": 1,  "offset": 90}, # Elbow
+            3: {"servo": servo.Servo(self.pca.channels[3], min_pulse=600, max_pulse=2400), "dir": 1,  "offset": 90}, # Wrist
+}
         
         # Channel khusus Gripper (Capit)
         self.gripper_channel = 4
@@ -55,11 +55,12 @@ class HardwareBridgeNode(Node):
             if i in self.servos:
                 # Konversi: 0 radian = 90 derajat (Tengah)
                 # Rumus: (rad * 180 / pi) + 90
-                deg = math.degrees(rad) + 90.0
+                cvg = self.servos[i]    
+                deg = cfg["dir"] * math.degrees(rad) + cfg["offset"]
                 
                 # Batasi (Clamp) agar tidak merusak servo mekanis
                 deg = max(0.0, min(180.0, deg))
-                
+                cfg["servo"].angle = deg
                 try:
                     self.servos[i].angle = deg
                 except Exception as e:

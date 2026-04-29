@@ -31,7 +31,7 @@ Standalone (no ROS2):
 ROS2:
   ros2 run <pkg> real_camera_node \\
     --ros-args \\
-    -p model_path:=yolov8n.pt \\
+    -p model_path:=best.pt \\
     -p target_class:=person \\
     -p camera_id:=0 \\
     -p conf_threshold:=0.45 \\
@@ -86,8 +86,8 @@ except ImportError:
     YOLO_AVAILABLE = False
 
 # ── Defaults ─────────────────────────────────────────────────────
-DEFAULT_MODEL = 'yolov8n.pt'
-DEFAULT_CLASS = 'car'       # COCO index 0
+DEFAULT_MODEL = 'best.pt'
+DEFAULT_CLASS = 'Tabung'       # COCO index 0
 DEFAULT_CONF  = 0.15
 DEFAULT_CAM   = 1
 
