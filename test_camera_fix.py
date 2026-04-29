@@ -6,6 +6,30 @@ Simple test to verify camera opening fix works on Linux
 import sys
 import cv2
 
+def build_camera_sources(camera_id: int):
+    return [camera_id]
+
+
+def build_capture_backends():
+    if not sys.platform.startswith('linux'):
+        return [cv2.CAP_ANY]
+
+    backends = []
+    for attr_name in ('CAP_ANY', 'CAP_V4L2'):
+        backend = getattr(cv2, attr_name, None)
+        if backend is not None and backend not in backends:
+            backends.append(backend)
+    return backends or [cv2.CAP_ANY]
+
+
+def capture_is_usable(cap) -> bool:
+    for _ in range(3):
+        ok, frame = cap.read()
+        if ok and frame is not None and getattr(frame, 'size', 0) > 0:
+            return True
+    return False
+
+
 def test_camera_opening():
     """Test that camera can be opened with our fix logic"""
     print("Testing camera opening logic...")
@@ -13,34 +37,24 @@ def test_camera_opening():
     # Simulate the logic we added to real_camera_node.py
     camera_id = 0  # Default camera ID
     cap = None
-    camera_indices_to_try = [camera_id]
-
-    # On Linux, try additional common camera indices
-    if sys.platform.startswith('linux'):
-        camera_indices_to_try.extend([0, 1, 2, 3])
-
-    # Remove duplicates while preserving order
-    seen = set()
-    unique_indices = []
-    for idx in camera_indices_to_try:
-        if idx not in seen:
-            seen.add(idx)
-            unique_indices.append(idx)
+    sources_to_try = build_camera_sources(camera_id)
+    backends_to_try = build_capture_backends()
 
     last_error = None
-    for idx in unique_indices:
+    for source in sources_to_try:
         try:
-            # Try different backends for better Linux compatibility
-            backends = [cv2.CAP_ANY]
-            if sys.platform.startswith('linux'):
-                backends.extend([cv2.CAP_V4L2, cv2.CAP_GSTREAMER])
-
-            for backend in backends:
-                test_cap = cv2.VideoCapture(idx, backend)
+            for backend in backends_to_try:
+                test_cap = cv2.VideoCapture(source, backend)
                 if test_cap.isOpened():
+                    test_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                    test_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                    if not capture_is_usable(test_cap):
+                        test_cap.release()
+                        continue
                     cap = test_cap
-                    camera_id = idx  # Update to the working index
+                    camera_id = source
                     break
+                test_cap.release()
 
             if cap is not None:
                 break
@@ -50,7 +64,8 @@ def test_camera_opening():
             continue
 
     if cap is None or not cap.isOpened():
-        error_msg = f"Cannot open camera index {camera_id}"
+        tried_sources = ', '.join(str(src) for src in sources_to_try)
+        error_msg = f"Cannot open camera index {camera_id} (tried: {tried_sources})"
         if last_error:
             error_msg += f": {last_error}"
         if sys.platform.startswith('linux'):
@@ -58,8 +73,7 @@ def test_camera_opening():
                        "  1. Check if your user is in the 'video' group: groups\n" \
                        "  2. If not, add yourself: sudo usermod -a -G video $USER\n" \
                        "  3. Log out and back in, or reboot\n" \
-                       "  4. Try different camera indices (0,1,2,3)\n" \
-                       "  5. Ensure no other process is using the camera"
+                       "  4. Ensure no other process is using the camera"
         print(f"FAILED: {error_msg}")
         return False
     else:
