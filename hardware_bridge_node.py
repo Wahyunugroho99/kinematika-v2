@@ -55,14 +55,13 @@ class HardwareBridgeNode(Node):
             if i in self.servos:
                 # Konversi: 0 radian = 90 derajat (Tengah)
                 # Rumus: (rad * 180 / pi) + 90
-                cvg = self.servos[i]    
+                cfg = self.servos[i]
                 deg = cfg["dir"] * math.degrees(rad) + cfg["offset"]
                 
                 # Batasi (Clamp) agar tidak merusak servo mekanis
                 deg = max(0.0, min(180.0, deg))
-                cfg["servo"].angle = deg
                 try:
-                    self.servos[i].angle = deg
+                    cfg["servo"].angle = deg
                 except Exception as e:
                     self.get_logger().error(f"Error memutar servo {i}: {e}")
 
@@ -81,7 +80,7 @@ class HardwareBridgeNode(Node):
     def destroy_node(self):
         """Matikan semua servo (Release torque) saat node dimatikan."""
         for i in self.servos:
-            self.servos[i].angle = None
+            self.servos[i]["servo"].angle = None
         self.gripper_servo.angle = None
         self.pca.deinit()
         super().destroy_node()
